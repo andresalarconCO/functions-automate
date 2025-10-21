@@ -1,0 +1,375 @@
+<?php
+if (!defined('ABSPATH')) exit;
+define('HELLO_ELEMENTOR_CHILD_VERSION', '2.0.0');
+
+/** Estilos del tema hijo **/
+add_action('wp_enqueue_scripts', function() {
+	wp_enqueue_style('hello-elementor-parent-style', get_template_directory_uri() . '/style.css');
+	wp_enqueue_style(
+		'hello-elementor-child-style',
+		get_stylesheet_directory_uri() . '/style.css',
+		['hello-elementor-parent-style'],
+		filemtime(get_stylesheet_directory() . '/style.css')
+	);
+}, 20);
+
+/**
+ * 🧩 1️⃣ Decodificador Cloudflare (reutilizable)
+ */
+if (!function_exists('orbidi_decode_cfemail')) {
+	function orbidi_decode_cfemail($encoded) {
+		if (empty($encoded) || !ctype_xdigit($encoded)) return '';
+		$key = hexdec(substr($encoded, 0, 2));
+		$decoded = '';
+		for ($i = 2, $len = strlen($encoded); $i < $len; $i += 2) {
+			$decoded .= chr(hexdec(substr($encoded, $i, 2)) ^ $key);
+		}
+		return $decoded;
+	}
+}
+
+/**
+ * 🧠 2️⃣ Proceso principal de scraping del Brief
+ */
+function orbidi_procesar_brief($url) {
+	if (empty($url)) return false;
+
+	$response = wp_remote_get($url, [
+		'headers' => ['Authorization' => 'Basic ' . base64_encode('user:password')],
+		'timeout' => 15,
+		'sslverify' => false,
+	]);
+
+	if (is_wp_error($response)) return false;
+
+	$html = wp_remote_retrieve_body($response);
+	if (empty($html)) return false;
+
+	// --- Campos base ---
+	$fields = [
+		'razon_social'     => 'RAZON_SOCIAL',
+		'cif_cliente'      => 'CIF_CLIENTE',
+		'telefono'         => 'TELEFONO_CONTACTO',
+		'email'            => 'EMAIL_CONTACTO',
+		'direccion'        => 'DIRECCIÓN_CLIENTE',
+		'nombre_comercial' => 'NOMBRE_CLIENTE',
+	];
+
+	$legales = [];
+
+	foreach ($fields as $key => $label) {
+		if (preg_match("/<strong[^>]*>{$label}.*?<\/strong>\s*:?\s*(.*?)<\/li>/isu", $html, $match)) {
+			$valor = sanitize_text_field(trim(wp_strip_all_tags(html_entity_decode($match[1]))));
+			$legales[$key] = trim($valor, ": \t\n\r\0\x0B");
+		}
+	}
+
+	// --- Email ---
+	if (preg_match('/data-cfemail="([a-f0-9]+)"/i', $html, $cf)) {
+		$legales['email'] = orbidi_decode_cfemail($cf[1]);
+	} elseif (empty($legales['email']) && preg_match('/[\w.\-]+@[\w.\-]+\.[A-Za-z]{2,}/', $html, $em)) {
+		$legales['email'] = sanitize_email($em[0]);
+	}
+
+	// --- Dominio ---
+	if (preg_match('/dominio\s+deseado\s*:\s*(.*?)<\/li>/isu', $html, $m)) {
+		$dominio = sanitize_text_field(trim(wp_strip_all_tags($m[1])));
+		$dominio = preg_replace(['#^https?://#i', '#/$#'], '', $dominio);
+		if ($dominio && !preg_match('/^www\./i', $dominio)) $dominio = 'www.' . $dominio;
+		$legales['website_url'] = $dominio;
+	}
+
+	// --- Fecha ---
+	static $meses = [
+		1 => 'enero', 2 => 'febrero', 3 => 'marzo', 4 => 'abril',
+		5 => 'mayo', 6 => 'junio', 7 => 'julio', 8 => 'agosto',
+		9 => 'septiembre', 10 => 'octubre', 11 => 'noviembre', 12 => 'diciembre'
+	];
+	$t = current_time('timestamp');
+	$legales['fecha'] = sprintf(
+		'%d de %s de %d',
+		date_i18n('j', $t),
+		$meses[(int)date_i18n('n', $t)],
+		date_i18n('Y', $t)
+	);
+
+	// --- Guardar datos ---
+	$actual = (array)get_option('legales', []);
+
+	// 🔑 Generar BitPass antes de guardar
+	if (!empty($legales['cif_cliente'])) {
+		$legales['bitpass'] = $legales['cif_cliente'] . '-KD-2025';
+	}
+
+	// 🔄 Fusionar y guardar todo en "legales"
+	$nuevos_datos = array_merge($actual, $legales);
+	update_option('legales', $nuevos_datos);
+
+	// 🧩 Sincronizar con Complianz
+	sincronizar_con_complianz('legales', [], $nuevos_datos);
+
+	// 👤 Crear usuario si procede
+	if (!empty($legales['email']) && !empty($legales['cif_cliente'])) {
+		orbidi_crear_usuario_desde_brief(
+			$legales['email'],
+			$legales['cif_cliente']
+		);
+	}
+
+	// 💾 Guardar BitPass también como opción individual (por compatibilidad)
+	if (!empty($legales['bitpass'])) {
+		update_option('bitpass', $legales['bitpass']);
+	}
+
+	return true;
+
+}
+
+/**
+ * 👤 7️⃣ Crear usuario automáticamente desde los datos del Brief
+ *      - Nombre de usuario: parte local del email (antes del @), si no existe usa el CIF
+ *      - Contraseña: <CIF_CLIENTE>+KD-2025
+ *      - Rol: editor
+ */
+function orbidi_crear_usuario_desde_brief($email, $cif) {
+	if (empty($email) || empty($cif)) return false;
+
+	// Verificar si ya existe por email
+	if (email_exists($email)) {
+		return get_user_by('email', $email)->ID;
+	}
+
+	// Username será la parte antes del @ del email; si no, usa el CIF
+	$parts = explode('@', $email);
+	$username = sanitize_user($parts[0] ?? '', true);
+	if (empty($username)) $username = sanitize_user($cif, true);
+
+	// Asegurar unicidad del username
+	$base_username = $username;
+	$i = 1;
+	while (username_exists($username)) {
+		$username = $base_username . $i;
+		$i++;
+	}
+
+	// Contraseña fija según patrón
+	$password = $cif . '+KD-2025';
+
+	// Crear usuario
+	$user_id = wp_create_user($username, $password, $email);
+
+	if (is_wp_error($user_id)) {
+		error_log('❌ Error al crear usuario: ' . $user_id->get_error_message());
+		return false;
+	}
+
+	// Asignar rol "editor"
+	wp_update_user([
+		'ID' => $user_id,
+		'display_name' => $email, // según tu petición: nombre = email
+		'role' => 'editor'
+	]);
+
+	// Guardar el CIF como metadato y marca de origen
+	update_user_meta($user_id, 'cif_cliente', sanitize_text_field($cif));
+	update_user_meta($user_id, 'origen_brief', true);
+
+	return $user_id;
+}
+
+/**
+ * 🔄 3️⃣ Sincronización Complianz + BitPass
+ */
+add_action('update_option_legales', 'sincronizar_con_complianz', 10, 3);
+function sincronizar_con_complianz($option, $old_value, $value) {
+	if ($option !== 'legales' || !is_array($value)) return;
+
+	$razon_social = sanitize_text_field($value['razon_social'] ?? '');
+	$direccion    = sanitize_text_field($value['direccion'] ?? '');
+	$telefono_raw = trim($value['telefono'] ?? '');
+	$email        = sanitize_email($value['email'] ?? '');
+	$cif          = sanitize_text_field($value['cif_cliente'] ?? '');
+
+	// Mantiene el + del prefijo internacional (por ejemplo +34)
+	$telefono = preg_replace('/(?!^\+)[^\d]/', '', $telefono_raw);
+
+	// ✅ Actualizar Complianz
+	$cmplz = array_merge((array)get_option('cmplz_options', []), [
+		'organisation_name' => $razon_social,
+		'address_company'   => $direccion,
+		'telephone_company' => $telefono,
+		'email_company'     => $email,
+	]);
+	update_option('cmplz_options', $cmplz);
+
+	// ✅ Actualizar BitPass automáticamente
+	if (!empty($cif)) {
+		$bitpass = $cif . '-KD-2025';
+		update_option('bitpass', $bitpass);
+	}
+}
+
+
+
+
+/**
+ * 🧩 4️⃣ AJAX: guardar URL del Brief
+ */
+add_action('wp_ajax_orbidi_update_brief_url', function() {
+	check_ajax_referer('orbidi_update_brief_url', 'nonce');
+	$url = esc_url_raw($_POST['url'] ?? '');
+
+	if (empty($url))
+		wp_send_json_error('⚠️ La URL no puede estar vacía.');
+
+	$legales = (array)get_option('legales', []);
+	$legales['brief_url'] = $url;
+	update_option('legales', $legales);
+
+	wp_send_json_success('✅ URL guardada correctamente.');
+});
+
+/**
+ * 🧩 5️⃣ AJAX: ejecutar scraping y sincronización
+ */
+add_action('wp_ajax_orbidi_refresh_brief', function() {
+	check_ajax_referer('orbidi_brief_refresh', 'nonce');
+	$legales = (array)get_option('legales', []);
+	$url = $legales['brief_url'] ?? '';
+
+	if (empty($url))
+		wp_send_json_error('⚠️ No hay URL configurada.');
+
+	$ok = orbidi_procesar_brief($url);
+	wp_send_json($ok ? ['success' => true, 'message' => '✅ Datos actualizados correctamente.'] :
+		['success' => false, 'message' => '❌ No se pudieron obtener los datos.']);
+});
+
+/**
+ * 🗑️ 6️⃣ AJAX: eliminar URL del Brief
+ */
+add_action('wp_ajax_orbidi_delete_brief_url', function() {
+	check_ajax_referer('orbidi_delete_brief_url', 'nonce');
+	$legales = (array)get_option('legales', []);
+	unset($legales['brief_url']);
+	update_option('legales', $legales);
+	wp_send_json_success('✅ URL del Brief eliminada correctamente.');
+});
+
+add_action('admin_footer', function() {
+	$screen = get_current_screen();
+	if (!$screen || strpos($screen->id, 'page_legales') === false) return;
+
+	$legales = get_option('legales', []);
+	$current_url = esc_url($legales['brief_url'] ?? '');
+	?>
+	<script>
+	document.addEventListener('DOMContentLoaded', () => {
+		const title = document.querySelector('.cx-ui-kit__title.cx-section__title');
+		if (!title) return;
+
+		// 🔹 Contenedor flex
+		const container = document.createElement('div');
+		container.style.display = 'flex';
+		container.style.alignItems = 'center';
+		container.style.gap = '6px';
+		container.style.marginLeft = '10px';
+
+		// 🔹 Input URL
+		const input = document.createElement('input');
+		input.type = 'url';
+		input.value = '<?php echo $current_url; ?>';
+		input.id = 'orbidi-brief-url';
+		input.placeholder = 'https://api.g97.io/.../brief';
+		input.style.width = '360px';
+		input.style.padding = '4px 8px';
+
+		// 🔹 Botón actualizar
+		const btn = document.createElement('button');
+		btn.textContent = '🔁 Actualizar desde Brief';
+		btn.className = 'button button-primary';
+
+		// 🔹 Botón borrar
+		const clearBtn = document.createElement('button');
+		clearBtn.textContent = '🗑️ Borrar';
+		clearBtn.className = 'button button-secondary';
+		clearBtn.style.marginLeft = '2px';
+
+		container.appendChild(input);
+		container.appendChild(btn);
+		container.appendChild(clearBtn);
+		title.appendChild(container);
+
+		// 🔄 Acción actualizar
+		btn.addEventListener('click', async () => {
+			btn.disabled = true;
+			btn.textContent = 'Actualizando...';
+
+			try {
+				const save = await fetch(ajaxurl, {
+					method: 'POST',
+					headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+					body: new URLSearchParams({
+						action: 'orbidi_update_brief_url',
+						url: input.value,
+						nonce: '<?php echo wp_create_nonce('orbidi_update_brief_url'); ?>'
+					})
+				});
+				const saved = await save.json();
+				if (!saved.success) throw new Error(saved.data || saved.message);
+
+				const sync = await fetch(ajaxurl, {
+					method: 'POST',
+					headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+					body: new URLSearchParams({
+						action: 'orbidi_refresh_brief',
+						nonce: '<?php echo wp_create_nonce('orbidi_brief_refresh'); ?>'
+					})
+				});
+				const data = await sync.json();
+				alert(data.data || data.message);
+				setTimeout(() => location.reload(), 1500);
+			}
+			catch(err) {
+				alert('❌ Error: ' + err.message);
+				console.error(err);
+				btn.disabled = false;
+				btn.textContent = '🔁 Actualizar desde Brief';
+			}
+		});
+
+        // 🗑️ Acción borrar (versión final)
+        clearBtn.addEventListener('click', async () => {
+        	if (!confirm('¿Seguro que quieres borrar la URL del Brief?')) return;
+        	input.value = '';
+        
+        	try {
+        		const res = await fetch(ajaxurl, {
+        			method: 'POST',
+        			headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        			body: new URLSearchParams({
+        				action: 'orbidi_delete_brief_url',
+        				nonce: '<?php echo wp_create_nonce('orbidi_delete_brief_url'); ?>'
+        			})
+        		});
+        		const data = await res.json();
+        		alert(data.message || '✅ Brief eliminado correctamente.');
+        		setTimeout(() => location.reload(), 1000);
+        	}
+        	catch(err) {
+        		alert('❌ Error al borrar la URL.');
+        		console.error(err);
+        	}
+        });
+
+	});
+	</script>
+	<style>
+		#orbidi-brief-url {
+			border: 1px solid #ccc;
+			border-radius: 4px;
+			height: 30px;
+		}
+	</style>
+	<?php
+});
